@@ -42,7 +42,8 @@
       "WebFetch(domain:astra-wiki.readthedocs.io)",
       "Bash(curl -s \"https://raw.githubusercontent.com/orbbec/ros_astra_camera/main/include/openni2_redist/arm64/OpenNI2/Drivers/orbbec.ini\")",
       "Bash(curl -s \"https://api.github.com/repos/orbbec/ros_astra_camera/contents/include/openni2_redist/arm64/OpenNI2/Drivers/liborbbec.so\")",
-      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\('SHA:', d.get\\('sha',''\\)\\); print\\('Size:', d.get\\('size',''\\)\\); print\\('Download URL:', d.get\\('download_url',''\\)\\)\")"
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\('SHA:', d.get\\('sha',''\\)\\); print\\('Size:', d.get\\('size',''\\)\\); print\\('Download URL:', d.get\\('download_url',''\\)\\)\")",
+      "Bash(sudo -n cat /usr/lib/aarch64-linux-gnu/OpenNI2/Drivers/orbbec.ini)"
     ]
   }
 }
