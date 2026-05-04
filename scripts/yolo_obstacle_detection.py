@@ -59,25 +59,73 @@ def analyze_depth_zones(depth_mm):
     return tuple(zones)
 
 
+# Minimum clearance a side must show before we'll commit to steering into it
+# when the center is blocked. Below this we'd rather STOP than turn into a
+# space we're not sure is wide enough.
+AVOID_MIN_CLEARANCE_M = 0.70
+
+
+def is_blocked(dist_m):
+    """A zone is "blocked" if it reads close OR has insufficient valid depth.
+    `inf` (no valid pixels) almost always means an obstacle is closer than
+    the Astra Pro's 0.6m minimum range, which makes the IR pattern saturate
+    and the depth read as zero — i.e. *more* dangerous, not safer."""
+    return dist_m <= DIST_STOP_M or dist_m == float("inf")
+
+
 def decide(zones):
     left_m, center_m, right_m = zones
+    blocked = [is_blocked(d) for d in zones]
+    n_blocked = sum(blocked)
 
-    if center_m <= DIST_STOP_M:
+    # 1. Everything blocked / unknown → STOP.
+    if n_blocked == 3:
         return {"status": "STOP", "throttle": 0.0, "steer": 0.0, "action": "STOP"}
 
-    if center_m <= DIST_CAUTION_M:
-        # Steer toward the side with more clear space.
-        steer = -0.6 if left_m > right_m else 0.6
+    # 2. Center blocked → must avoid.
+    if blocked[1]:
+        if not blocked[0] and not blocked[2]:
+            # Both sides open: turn toward the wider one.
+            steer = -0.6 if left_m > right_m else 0.6
+        elif not blocked[0]:
+            # Only LEFT is known clear — commit only if it has real room.
+            if left_m >= AVOID_MIN_CLEARANCE_M:
+                steer = -0.6
+            else:
+                return {"status": "STOP", "throttle": 0.0, "steer": 0.0, "action": "STOP"}
+        else:
+            # Only RIGHT is known clear.
+            if right_m >= AVOID_MIN_CLEARANCE_M:
+                steer = 0.6
+            else:
+                return {"status": "STOP", "throttle": 0.0, "steer": 0.0, "action": "STOP"}
         return {"status": "AVOID", "throttle": 0.3, "steer": steer, "action": "AVOID"}
 
-    # Center is open. Bias gently toward whichever side is more open so we
-    # naturally hug the safer corridor.
-    if left_m == float("inf") and right_m == float("inf"):
-        steer = 0.0
+    # 3. Center open but tight → slow down and steer toward more space.
+    if center_m <= DIST_CAUTION_M:
+        if not blocked[0] and not blocked[2]:
+            steer = -0.6 if left_m > right_m else 0.6
+        elif not blocked[0]:
+            steer = -0.6
+        elif not blocked[2]:
+            steer = 0.6
+        else:
+            steer = 0.0
+        return {"status": "AVOID", "throttle": 0.3, "steer": steer, "action": "AVOID"}
+
+    # 4. Center clear. Bias gently toward whichever side has more headroom,
+    # and bias *away* from a side we have no data on (treat unknown as risky).
+    if blocked[0] and not blocked[2]:
+        steer = 0.2   # left is unknown/close → favor right
+    elif blocked[2] and not blocked[0]:
+        steer = -0.2  # right is unknown/close → favor left
+    elif not blocked[0] and not blocked[2]:
+        steer = float(np.clip(
+            (right_m - left_m) / max(left_m, right_m, 1.0),
+            -0.3, 0.3,
+        ))
     else:
-        ld = left_m if left_m != float("inf") else 10.0
-        rd = right_m if right_m != float("inf") else 10.0
-        steer = float(np.clip((rd - ld) / max(ld, rd), -0.3, 0.3))
+        steer = 0.0  # both sides unknown but center clear — go straight, slow nothing
     return {"status": "GO", "throttle": 0.7, "steer": steer, "action": "GO"}
 
 
@@ -114,6 +162,9 @@ def render_depth_panel(depth_mm, zones, decision):
     depth_disp = np.clip(depth_mm, 600, 4000).astype(np.float32)
     depth_disp = ((depth_disp - 600) / (4000 - 600) * 255).astype(np.uint8)
     panel = cv2.applyColorMap(depth_disp, cv2.COLORMAP_TURBO)
+    # Invalid pixels (depth==0) → black, so "no data" is visually distinct
+    # from "very close" (which would otherwise both render dark purple).
+    panel[depth_mm == 0] = 0
 
     y0 = int(FRAME_H * BAND_TOP_FRAC)
     y1 = int(FRAME_H * BAND_BOT_FRAC)

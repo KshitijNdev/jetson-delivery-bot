@@ -24,7 +24,11 @@ os.makedirs(BLOCKED_DIR, exist_ok=True)
 def depth_to_color(depth_mm):
     depth_disp = np.clip(depth_mm, 600, 4000).astype(np.float32)
     depth_disp = ((depth_disp - 600) / (4000 - 600) * 255).astype(np.uint8)
-    return cv2.applyColorMap(depth_disp, cv2.COLORMAP_TURBO)
+    panel = cv2.applyColorMap(depth_disp, cv2.COLORMAP_TURBO)
+    # Invalid pixels (depth==0) → black so "no data / too close" is visually
+    # distinct from "very far".
+    panel[depth_mm == 0] = 0
+    return panel
 
 
 def main():
