@@ -6,127 +6,26 @@ from PIL import Image, ImageTk
 from ultralytics import YOLO
 
 from astra_camera import AstraCamera
+from nav_logic import (
+    Navigator, analyze_depth_zones,
+    DIST_STOP_M, DIST_CAUTION_M, DIST_DANGER_SCREEN_M,
+    BAND_TOP_FRAC, BAND_BOT_FRAC,
+)
 
 # Depth-first navigation, YOLO secondary for object labelling.
-# Decisions (STOP / AVOID / GO + steering) are computed from the depth frame
-# zoned LEFT / CENTER / RIGHT. YOLO runs on the color frame to identify
-# *what* objects are visible (e.g. for delivery-target recognition), but
-# does not influence steering or throttle.
+# Decision logic lives in `nav_logic` so the simulator and the live navigator
+# exercise the same code. YOLO runs on the color frame to identify *what*
+# objects are visible (e.g. for delivery-target recognition), but does not
+# influence steering or throttle.
 
 model = YOLO("yolov8n.pt")
 cam = AstraCamera()
+nav = Navigator()
 
 FRAME_W = cam.width
 FRAME_H = cam.height
 
-# Vertical band of the depth frame used for navigation decisions. We ignore
-# the top (ceiling/sky) and bottom (immediate floor) so distant obstacles at
-# robot height drive the decision.
-BAND_TOP_FRAC = 0.30
-BAND_BOT_FRAC = 0.85
-
-# Distance thresholds (metres).
-DIST_STOP_M = 0.50
-DIST_CAUTION_M = 1.20
-DIST_DANGER_SCREEN_M = 0.35
-
-# Zone sampling: 5th-percentile so a few noisy near-zero pixels don't
-# trigger false stops. Need at least this many valid pixels per zone for
-# the reading to count.
-ZONE_MIN_VALID_PX = 200
-
 CONF_THRESH = 0.45
-
-
-def analyze_depth_zones(depth_mm):
-    """Returns (left_m, center_m, right_m) — nearest obstacle per zone in metres.
-    `inf` means insufficient valid data (treat as safe)."""
-    y0 = int(FRAME_H * BAND_TOP_FRAC)
-    y1 = int(FRAME_H * BAND_BOT_FRAC)
-    band = depth_mm[y0:y1, :]
-
-    zw = FRAME_W // 3
-    zones = []
-    for i in range(3):
-        x0 = i * zw
-        x1 = (i + 1) * zw if i < 2 else FRAME_W
-        z = band[:, x0:x1]
-        valid = z[z > 0]
-        if valid.size < ZONE_MIN_VALID_PX:
-            zones.append(float("inf"))
-        else:
-            zones.append(float(np.percentile(valid, 5)) / 1000.0)
-    return tuple(zones)
-
-
-# Minimum clearance a side must show before we'll commit to steering into it
-# when the center is blocked. Below this we'd rather STOP than turn into a
-# space we're not sure is wide enough.
-AVOID_MIN_CLEARANCE_M = 0.70
-
-
-def is_blocked(dist_m):
-    """A zone is "blocked" if it reads close OR has insufficient valid depth.
-    `inf` (no valid pixels) almost always means an obstacle is closer than
-    the Astra Pro's 0.6m minimum range, which makes the IR pattern saturate
-    and the depth read as zero — i.e. *more* dangerous, not safer."""
-    return dist_m <= DIST_STOP_M or dist_m == float("inf")
-
-
-def decide(zones):
-    left_m, center_m, right_m = zones
-    blocked = [is_blocked(d) for d in zones]
-    n_blocked = sum(blocked)
-
-    # 1. Everything blocked / unknown → STOP.
-    if n_blocked == 3:
-        return {"status": "STOP", "throttle": 0.0, "steer": 0.0, "action": "STOP"}
-
-    # 2. Center blocked → must avoid.
-    if blocked[1]:
-        if not blocked[0] and not blocked[2]:
-            # Both sides open: turn toward the wider one.
-            steer = -0.6 if left_m > right_m else 0.6
-        elif not blocked[0]:
-            # Only LEFT is known clear — commit only if it has real room.
-            if left_m >= AVOID_MIN_CLEARANCE_M:
-                steer = -0.6
-            else:
-                return {"status": "STOP", "throttle": 0.0, "steer": 0.0, "action": "STOP"}
-        else:
-            # Only RIGHT is known clear.
-            if right_m >= AVOID_MIN_CLEARANCE_M:
-                steer = 0.6
-            else:
-                return {"status": "STOP", "throttle": 0.0, "steer": 0.0, "action": "STOP"}
-        return {"status": "AVOID", "throttle": 0.3, "steer": steer, "action": "AVOID"}
-
-    # 3. Center open but tight → slow down and steer toward more space.
-    if center_m <= DIST_CAUTION_M:
-        if not blocked[0] and not blocked[2]:
-            steer = -0.6 if left_m > right_m else 0.6
-        elif not blocked[0]:
-            steer = -0.6
-        elif not blocked[2]:
-            steer = 0.6
-        else:
-            steer = 0.0
-        return {"status": "AVOID", "throttle": 0.3, "steer": steer, "action": "AVOID"}
-
-    # 4. Center clear. Bias gently toward whichever side has more headroom,
-    # and bias *away* from a side we have no data on (treat unknown as risky).
-    if blocked[0] and not blocked[2]:
-        steer = 0.2   # left is unknown/close → favor right
-    elif blocked[2] and not blocked[0]:
-        steer = -0.2  # right is unknown/close → favor left
-    elif not blocked[0] and not blocked[2]:
-        steer = float(np.clip(
-            (right_m - left_m) / max(left_m, right_m, 1.0),
-            -0.3, 0.3,
-        ))
-    else:
-        steer = 0.0  # both sides unknown but center clear — go straight, slow nothing
-    return {"status": "GO", "throttle": 0.7, "steer": steer, "action": "GO"}
 
 
 def get_roi_depth_m(depth_mm, x1, y1, x2, y2):
@@ -182,9 +81,10 @@ def render_depth_panel(depth_mm, zones, decision):
 
     # Status banner
     status_color = {
-        "STOP":  (0, 0, 255),
-        "AVOID": (0, 165, 255),
-        "GO":    (0, 255, 0),
+        "STOP":    (0, 0, 255),
+        "AVOID":   (0, 165, 255),
+        "GO":      (0, 255, 0),
+        "REVERSE": (255, 100, 200),
     }.get(decision["status"], (255, 255, 255))
     cv2.putText(panel, decision["status"], (10, FRAME_H - 14),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, status_color, 2)
@@ -233,7 +133,7 @@ def main():
             return
 
         zones = analyze_depth_zones(depth_mm)
-        decision = decide(zones)
+        decision = nav.step(zones)
 
         results = model(color, verbose=False)[0]
         annotate_color(color, results, depth_mm)
